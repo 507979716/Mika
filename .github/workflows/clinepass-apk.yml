@@ -65,6 +65,43 @@ jobs:
                // 沙箱程序只有 arm64 版本(jniLibs/arm64-v8a);APK 不限 ABI,别的设备照常安装、显示「此设备不支持沙箱」。
                // 沙箱程序要从 nativeLibraryDir 直接执行,安装时必须解到磁盘
                packaging { jniLibs { useLegacyPackaging = true } }
+          diff --git a/app/src/main/java/com/wangzan101/mika/settings/ReasoningOptions.kt b/app/src/main/java/com/wangzan101/mika/settings/ReasoningOptions.kt
+          index 031c3dc..17cfafb 100644
+          --- a/app/src/main/java/com/wangzan101/mika/settings/ReasoningOptions.kt
+          +++ b/app/src/main/java/com/wangzan101/mika/settings/ReasoningOptions.kt
+          @@ -1,6 +1,7 @@
+           package com.wangzan101.mika.settings
+           
+           import com.wangzan101.mika.core.model.ListedModel
+          +import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+           
+           /**
+            * 思考档位。服务商列表写明档位的模型,四种协议(Chat Completions、Messages、generateContent、Responses)都照它给
+          @@ -22,13 +23,20 @@ data class ReasoningOptions(val levels: List<String>, val fromProvider: Boolean)
+                       }
+                       // 仍返回空选项,使已保存的旧档位能在界面恢复默认。
+                       if (listed?.reasoning == false) return ReasoningOptions(emptyList(), fromProvider = true)
+          -            return when (ProviderStore.adapterFor(config, listed?.endpoint).first) {
+          +            val (adapter, baseUrl) = ProviderStore.adapterFor(config, listed?.endpoint)
+          +            return when (adapter) {
+                           ProviderConfig.Kind.OpenAiResponses, ProviderConfig.Kind.ChatGpt, ProviderConfig.Kind.Xai ->
+                               ReasoningOptions(manualLevels, fromProvider = false)
+          -                // 预设里这家官方文档写明了几档就给几档;自定义地址对不上预设,照旧不猜
+          +                // Cline SDK 官方目录声明了这个模型的四档;公开 /models 未返回档位时按已知目录补上。
+          +                // 仅匹配实际请求的主机、协议和完整模型 ID;服务端显式给出的元数据仍优先。
+                           ProviderConfig.Kind.OpenAiCompat ->
+          -                    ProviderPresets.forBaseUrl(config.baseUrl)?.reasoningLevels
+          -                        ?.takeIf { it.isNotEmpty() }?.let { ReasoningOptions(it, fromProvider = false) }
+          +                    if (baseUrl.toHttpUrlOrNull()?.host == "api.cline.bot" &&
+          +                        config.model == "cline-pass/deepseek-v4.1-flash-1017") {
+          +                        ReasoningOptions(listOf("none", "low", "high", "max"), fromProvider = false)
+          +                    } else {
+          +                        ProviderPresets.forBaseUrl(config.baseUrl)?.reasoningLevels
+          +                            ?.takeIf { it.isNotEmpty() }?.let { ReasoningOptions(it, fromProvider = false) }
+          +                    }
+                           ProviderConfig.Kind.Anthropic, ProviderConfig.Kind.Gemini -> null
+                       }
+                   }
           diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
           index 02cde9d..7abc54c 100644
           --- a/app/src/main/res/values/strings.xml
@@ -77,6 +114,51 @@ jobs:
                <string name="a11y_service_description">This system permission lets Mika read and operate what\'s on any screen. Mika uses it only on its own virtual screen to do the tasks you give it, and acts on your main screen only when you hand it a task there.</string>
                <string name="channel_attention">Needs you</string>
                <string name="takeover_title">Needs you</string>
+          diff --git a/app/src/test/java/com/wangzan101/mika/settings/ReasoningSettingsTest.kt b/app/src/test/java/com/wangzan101/mika/settings/ReasoningSettingsTest.kt
+          index b079c4a..18285f0 100644
+          --- a/app/src/test/java/com/wangzan101/mika/settings/ReasoningSettingsTest.kt
+          +++ b/app/src/test/java/com/wangzan101/mika/settings/ReasoningSettingsTest.kt
+          @@ -135,6 +135,40 @@ class ReasoningSettingsTest {
+                   assertNull(ReasoningOptions.of(custom, ListedModel("m3")))
+               }
+           
+          +    @Test fun clinePassDeepSeekMaxCanBeSelectedAndSurvivesReload() {
+          +        val s = store()
+          +        val model = "cline-pass/deepseek-v4.1-flash-1017"
+          +        val p = s.connect("ClinePass", ProviderConfig.Kind.OpenAiCompat, "https://api.cline.bot/api/v1", "k",
+          +            listOf(ListedModel(model)))
+          +        assertTrue(s.use(ModelRole.Main, p.id, model, caps))
+          +        val options = ReasoningOptions.of(s.configFor(ModelRole.Main)!!, p.models!!.single())!!
+          +        assertEquals(listOf("none", "low", "high", "max"), options.levels)
+          +        assertFalse(options.fromProvider)
+          +        assertTrue(s.setReasoningEffort(ModelRole.Main, "max"))
+          +        val reloaded = store()
+          +        assertEquals("max", reloaded.roles.value.reasoningEffort(ModelRole.Main))
+          +        reloaded.modelFor(ModelRole.Main)
+          +        assertEquals("max", setups.last().reasoningEffort)
+          +        reloaded.modelFor(ModelRole.Light)
+          +        assertEquals("max", setups.last().reasoningEffort)
+          +    }
+          +
+          +    @Test fun clinePassFallbackIsSpecificAndExplicitMetadataWins() {
+          +        val model = "cline-pass/deepseek-v4.1-flash-1017"
+          +        val cfg = ProviderConfig("c", ProviderConfig.Kind.OpenAiCompat, "https://api.cline.bot/api/v1", model, caps)
+          +        assertEquals(listOf("none", "low", "high", "max"), ReasoningOptions.of(cfg, null)!!.levels)
+          +        assertNull(ReasoningOptions.of(cfg.copy(model = "cline-pass/other"), null))
+          +        assertNull(ReasoningOptions.of(cfg.copy(baseUrl = "https://api.cline.bot.example/api/v1"), null))
+          +        assertNull(ReasoningOptions.of(cfg.copy(kind = ProviderConfig.Kind.Anthropic), null))
+          +        val external = ListedModel(model, endpoint = ModelEndpoint(ModelProtocol.ChatCompletions, "https://custom.example/v1"))
+          +        assertNull(ReasoningOptions.of(cfg, external))
+          +        val declared = ReasoningOptions.of(cfg, ListedModel(model, reasoningEfforts = listOf("high")))!!
+          +        assertEquals(listOf("high"), declared.levels)
+          +        assertTrue(declared.fromProvider)
+          +        assertEquals(emptyList<String>(), ReasoningOptions.of(cfg, ListedModel(model, reasoning = false))!!.levels)
+          +        assertEquals(emptyList<String>(), ReasoningOptions.of(cfg, ListedModel(model, reasoningEfforts = emptyList()))!!.levels)
+          +    }
+          +
+               // Anthropic 列表写明的档位照给;只接受按预算思考的模型能思考但没有可选档位,也不接受档位
+               @Test fun anthropicOffersExactlyTheCatalogLevels() {
+                   val cfg = ProviderConfig("c", ProviderConfig.Kind.Anthropic, "https://api.anthropic.example", "m", caps)
           diff --git a/core/src/main/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModel.kt b/core/src/main/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModel.kt
           index f03c876..229bc5c 100644
           --- a/core/src/main/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModel.kt
@@ -99,7 +181,7 @@ jobs:
                        .apply { if (!apiKey.isNullOrEmpty()) header("Authorization", "Bearer $apiKey") }
                        .postInference(InferenceProtocol.Chat, payload)
           diff --git a/core/src/test/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModelTest.kt b/core/src/test/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModelTest.kt
-          index 697c9f0..94e8802 100644
+          index 697c9f0..c4d4d00 100644
           --- a/core/src/test/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModelTest.kt
           +++ b/core/src/test/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModelTest.kt
           @@ -8,6 +8,7 @@ import kotlinx.serialization.json.jsonArray
@@ -127,7 +209,7 @@ jobs:
                    val j = Json.parseToJsonElement(req.body.readUtf8()).jsonObject
                    assertEquals("system", j["messages"]!!.jsonArray[0].jsonObject["role"]!!.jsonPrimitive.content)
                    assertEquals("function", j["tools"]!!.jsonArray[0].jsonObject["type"]!!.jsonPrimitive.content)
-          @@ -71,6 +75,25 @@ class OpenAiCompatModelTest {
+          @@ -71,6 +75,33 @@ class OpenAiCompatModelTest {
                    assertEquals("application/json", req.getHeader("Accept"))
                }
            
@@ -138,16 +220,24 @@ jobs:
           +            .proxy(Proxy.NO_PROXY)
           +            .build()
           +        val base = server.url("/api/v1").newBuilder().host("api.cline.bot").build().toString()
-          +        val cline = OpenAiCompatModel(base, "test-key", "cline-pass/test", caps(), client)
+          +        val modelId = "cline-pass/deepseek-v4.1-flash-1017"
+          +        val cline = OpenAiCompatModel(base, "test-key", modelId, caps(), client, reasoningEffort = "max")
           +        server.enqueue(ok("""{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}"""))
           +        assertEquals(listOf(Part.Text("ok")), cline.complete("s", user, emptyList()).parts)
           +        val regular = server.takeRequest()
           +        assertEquals("openai", regular.getHeader("X-Response-Format"))
           +        assertEquals("/api/v1/chat/completions", regular.path)
+          +        val regularBody = Json.parseToJsonElement(regular.body.readUtf8()).jsonObject
+          +        assertEquals(modelId, regularBody["model"]!!.jsonPrimitive.content)
+          +        assertEquals("max", regularBody["reasoning_effort"]!!.jsonPrimitive.content)
           +        server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream")
           +            .setBody("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
           +        assertEquals(listOf(Part.Text("ok")), cline.completeStreaming("s", user, emptyList()) {}.parts)
-          +        assertEquals("openai", server.takeRequest().getHeader("X-Response-Format"))
+          +        val streaming = server.takeRequest()
+          +        assertEquals("openai", streaming.getHeader("X-Response-Format"))
+          +        val streamingBody = Json.parseToJsonElement(streaming.body.readUtf8()).jsonObject
+          +        assertEquals(modelId, streamingBody["model"]!!.jsonPrimitive.content)
+          +        assertEquals("max", streamingBody["reasoning_effort"]!!.jsonPrimitive.content)
           +    }
           +
                /** 服务端不听 `stream:false`、照样回 SSE 时:按流读完再拼,不当成坏 JSON。 */
@@ -164,6 +254,13 @@ jobs:
           ./gradlew :core:test
           --tests 'com.wangzan101.mika.core.model.OpenAiCompatModelTest'
           --tests 'com.wangzan101.mika.core.model.StreamingModelsTest'
+          --stacktrace --no-daemon
+
+      - name: Test saved ClinePass MAX reasoning settings
+        working-directory: Mika
+        run: >-
+          ./gradlew :app:testDebugUnitTest
+          --tests 'com.wangzan101.mika.settings.ReasoningSettingsTest'
           --stacktrace --no-daemon
 
       - name: Build signed personal APKs
@@ -195,7 +292,9 @@ jobs:
           Cline API key is entered only in the installed app; it is not part of this workflow or APK.
           Base URL: https://api.cline.bot/api/v1
           Protocol: OpenAI-compatible Chat Completions
-          Model: full cline-pass/... model ID from the ClinePass dashboard/docs.
+          Model: cline-pass/deepseek-v4.1-flash-1017
+          Reasoning: Select MAX in the app to send reasoning_effort=max (not automatically forced).
+          This model offers none, low, high, max when the Cline model listing omits effort metadata.
           Cline API requests automatically include X-Response-Format: openai.
           Independently built, not an official Mika release. Upstream: https://github.com/wangzan101/Mika
           INFO
@@ -219,5 +318,7 @@ jobs:
           path: |
             Mika/core/build/reports/tests/
             Mika/core/build/test-results/
+            Mika/app/build/reports/tests/
+            Mika/app/build/test-results/
           if-no-files-found: ignore
           retention-days: 7
