@@ -1,0 +1,223 @@
+name: Build Mika ClinePass APK
+
+# Add this file at .github/workflows/clinepass-apk.yml in your GitHub repository.
+# No Cline API key or other secret is needed. Enter your key in the installed app.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mika-clinepass-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out pinned upstream Mika source
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: wangzan101/Mika
+          ref: 5d3c7f9c0ce521812632674776b780a1b4bbf58a
+          path: Mika
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6.2.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4.0.4
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;35.0.0'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6.4.1
+        with:
+          cache-provider: basic
+
+      - name: Apply ClinePass compatibility patch
+        working-directory: Mika
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/clinepass.patch" <<'CLINEPASS_PATCH'
+          diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+          index cb4685c..fafbf60 100644
+          --- a/app/build.gradle.kts
+          +++ b/app/build.gradle.kts
+          @@ -26,6 +26,14 @@ android {
+                   buildConfigField("boolean", "BETA", "true")
+               }
+           
+          +    // 个人 ClinePass 适配包与官方版并存,使用本次构建自己的签名和独立数据目录。
+          +    if (providers.gradleProperty("clinePassBuild").isPresent) {
+          +        defaultConfig {
+          +            applicationId = "com.wangzan101.mika.clinepass"
+          +            versionName = "0.1.38-clinepass"
+          +        }
+          +    }
+          +
+               // 沙箱程序只有 arm64 版本(jniLibs/arm64-v8a);APK 不限 ABI,别的设备照常安装、显示「此设备不支持沙箱」。
+               // 沙箱程序要从 nativeLibraryDir 直接执行,安装时必须解到磁盘
+               packaging { jniLibs { useLegacyPackaging = true } }
+          diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+          index 02cde9d..7abc54c 100644
+          --- a/app/src/main/res/values/strings.xml
+          +++ b/app/src/main/res/values/strings.xml
+          @@ -1,6 +1,6 @@
+           <?xml version="1.0" encoding="utf-8"?>
+           <resources>
+          -    <string name="app_name" translatable="false">Mika</string>
+          +    <string name="app_name" translatable="false">Mika ClinePass</string>
+               <string name="a11y_service_description">This system permission lets Mika read and operate what\'s on any screen. Mika uses it only on its own virtual screen to do the tasks you give it, and acts on your main screen only when you hand it a task there.</string>
+               <string name="channel_attention">Needs you</string>
+               <string name="takeover_title">Needs you</string>
+          diff --git a/core/src/main/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModel.kt b/core/src/main/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModel.kt
+          index f03c876..229bc5c 100644
+          --- a/core/src/main/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModel.kt
+          +++ b/core/src/main/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModel.kt
+          @@ -17,6 +17,7 @@ import kotlinx.serialization.json.jsonPrimitive
+           import kotlinx.serialization.json.put
+           import kotlinx.serialization.json.putJsonArray
+           import kotlinx.serialization.json.putJsonObject
+          +import okhttp3.HttpUrl.Companion.toHttpUrl
+           import okhttp3.OkHttpClient
+           import okhttp3.Request
+           
+          @@ -109,6 +110,8 @@ class OpenAiCompatModel(
+                   }
+                   return Request.Builder().url(endpoint)
+                       .withHeaders(headers)
+          +            // Cline 的非流式响应默认包在 data 里;要求标准 OpenAI 顶层 choices,兼容测试与普通调用。
+          +            .apply { if (endpoint.toHttpUrl().host == "api.cline.bot") header("X-Response-Format", "openai") }
+                       .header("Accept", if (stream) "text/event-stream" else "application/json")
+                       .apply { if (!apiKey.isNullOrEmpty()) header("Authorization", "Bearer $apiKey") }
+                       .postInference(InferenceProtocol.Chat, payload)
+          diff --git a/core/src/test/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModelTest.kt b/core/src/test/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModelTest.kt
+          index 697c9f0..94e8802 100644
+          --- a/core/src/test/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModelTest.kt
+          +++ b/core/src/test/kotlin/com/wangzan101/mika/core/model/OpenAiCompatModelTest.kt
+          @@ -8,6 +8,7 @@ import kotlinx.serialization.json.jsonArray
+           import kotlinx.serialization.json.jsonObject
+           import kotlinx.serialization.json.jsonPrimitive
+           import okhttp3.OkHttpClient
+          +import okhttp3.Dns
+           import okhttp3.mockwebserver.MockResponse
+           import okhttp3.mockwebserver.MockWebServer
+           import okhttp3.mockwebserver.SocketPolicy
+          @@ -18,6 +19,8 @@ import org.junit.Assert.assertNull
+           import org.junit.Assert.assertTrue
+           import org.junit.Before
+           import org.junit.Test
+          +import java.net.InetAddress
+          +import java.net.Proxy
+           
+           class OpenAiCompatModelTest {
+               private lateinit var server: MockWebServer
+          @@ -44,6 +47,7 @@ class OpenAiCompatModelTest {
+                   val req = server.takeRequest()
+                   assertEquals("/v1/chat/completions", req.path)
+                   assertEquals("Bearer sk-x", req.getHeader("Authorization"))
+          +        assertNull(req.getHeader("X-Response-Format"))
+                   val j = Json.parseToJsonElement(req.body.readUtf8()).jsonObject
+                   assertEquals("system", j["messages"]!!.jsonArray[0].jsonObject["role"]!!.jsonPrimitive.content)
+                   assertEquals("function", j["tools"]!!.jsonArray[0].jsonObject["type"]!!.jsonPrimitive.content)
+          @@ -71,6 +75,25 @@ class OpenAiCompatModelTest {
+                   assertEquals("application/json", req.getHeader("Accept"))
+               }
+           
+          +    /** Cline API 的普通请求和流式请求都带兼容头;只在本地假服务器验证,不调用真实服务。 */
+          +    @Test fun clineRequestsAskForStandardOpenAiResponse() = runTest {
+          +        val client = OkHttpClient.Builder()
+          +            .dns(object : Dns { override fun lookup(hostname: String) = listOf(InetAddress.getByName("127.0.0.1")) })
+          +            .proxy(Proxy.NO_PROXY)
+          +            .build()
+          +        val base = server.url("/api/v1").newBuilder().host("api.cline.bot").build().toString()
+          +        val cline = OpenAiCompatModel(base, "test-key", "cline-pass/test", caps(), client)
+          +        server.enqueue(ok("""{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}"""))
+          +        assertEquals(listOf(Part.Text("ok")), cline.complete("s", user, emptyList()).parts)
+          +        val regular = server.takeRequest()
+          +        assertEquals("openai", regular.getHeader("X-Response-Format"))
+          +        assertEquals("/api/v1/chat/completions", regular.path)
+          +        server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream")
+          +            .setBody("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+          +        assertEquals(listOf(Part.Text("ok")), cline.completeStreaming("s", user, emptyList()) {}.parts)
+          +        assertEquals("openai", server.takeRequest().getHeader("X-Response-Format"))
+          +    }
+          +
+               /** 服务端不听 `stream:false`、照样回 SSE 时:按流读完再拼,不当成坏 JSON。 */
+               @Test fun readsEventStreamReplyToANonStreamRequest() = runTest {
+                   val events = listOf(
+          CLINEPASS_PATCH
+          git apply --check "$RUNNER_TEMP/clinepass.patch"
+          git apply --whitespace=error "$RUNNER_TEMP/clinepass.patch"
+          chmod +x gradlew
+
+      - name: Test OpenAI and Cline request compatibility
+        working-directory: Mika
+        run: >-
+          ./gradlew :core:test
+          --tests 'com.wangzan101.mika.core.model.OpenAiCompatModelTest'
+          --tests 'com.wangzan101.mika.core.model.StreamingModelsTest'
+          --stacktrace --no-daemon
+
+      - name: Build signed personal APKs
+        working-directory: Mika
+        run: ./gradlew :app:assemblePerf -PclinePassBuild --stacktrace --no-daemon
+
+      - name: Verify APK identities and signatures
+        working-directory: Mika
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ../artifacts
+          cp app/build/outputs/apk/perf/app-universal-perf.apk ../artifacts/Mika-0.1.38-clinepass-universal.apk
+          cp app/build/outputs/apk/perf/app-arm64-v8a-perf.apk ../artifacts/Mika-0.1.38-clinepass-arm64.apk
+          for apk in ../artifacts/*.apk; do
+            "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$apk"
+            "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$apk" > "$apk.info.txt"
+            grep -F "package: name='com.wangzan101.mika.clinepass'" "$apk.info.txt"
+            grep -F "application-label:'Mika ClinePass'" "$apk.info.txt"
+          done
+          cd ../artifacts
+          sha256sum *.apk > SHA256SUMS.txt
+          cat > BUILD-INFO.txt <<'INFO'
+          Mika 0.1.38 ClinePass personal build
+          Package: com.wangzan101.mika.clinepass
+          Label: Mika ClinePass
+          Requires Android 11 or newer. Install the universal APK if unsure which ABI you need.
+          Uses a build-local debug signing certificate; different runs may require reinstalling this personal build.
+          Cline API key is entered only in the installed app; it is not part of this workflow or APK.
+          Base URL: https://api.cline.bot/api/v1
+          Protocol: OpenAI-compatible Chat Completions
+          Model: full cline-pass/... model ID from the ClinePass dashboard/docs.
+          Cline API requests automatically include X-Response-Format: openai.
+          Independently built, not an official Mika release. Upstream: https://github.com/wangzan101/Mika
+          INFO
+          echo '### Mika ClinePass APKs are ready' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Download **Mika-ClinePass-APKs** from the Artifacts section of this run.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'The universal APK works across supported architectures; Android 11+ is required.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload installable APKs
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: Mika-ClinePass-APKs
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload test diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: Mika-ClinePass-build-diagnostics
+          path: |
+            Mika/core/build/reports/tests/
+            Mika/core/build/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
